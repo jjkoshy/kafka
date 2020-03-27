@@ -2,11 +2,12 @@ package kafka.log
 
 import java.io.File
 import java.time.Duration
+import java.util.Properties
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicLong}
 
 import kafka.api.ApiVersion
-import kafka.server.{BrokerState, BrokerTopicStats, LogDirFailureChannel}
+import kafka.server.{BrokerState, BrokerTopicStats, KafkaConfig, KafkaServer, LogDirFailureChannel}
 import kafka.utils._
 import org.apache.kafka.common.TopicPartition
 import org.apache.kafka.common.record.{CompressionType, RecordVersion}
@@ -61,18 +62,22 @@ object StressLog extends Logging {
     val scheduler: KafkaScheduler = new KafkaScheduler(threads = 2)
     scheduler.startup()
 
+    val defaultProps = KafkaServer.copyKafkaConfigToLog(opts.kafkaConfig)
+    LogConfig.validateValues(defaultProps)
+    val defaultLogConfig = LogConfig(defaultProps)
+
     val logManager = new LogManager(
       logDirs = Seq(dir),
       initialOfflineDirs = Seq.empty,
       topicConfigs = Map.empty,
-      initialDefaultConfig = opts.logConfig,
+      initialDefaultConfig = defaultLogConfig,
       cleanerConfig = CleanerConfig(enableCleaner = false),
-      recoveryThreadsPerDataDir = 1,
-      flushCheckMs = 1000L,
-      flushRecoveryOffsetCheckpointMs = 10000L,
-      flushStartOffsetCheckpointMs = 10000L,
-      retentionCheckMs = 1000L,
-      maxPidExpirationMs = 60 * 60 * 1000,
+      recoveryThreadsPerDataDir = opts.kafkaConfig.numRecoveryThreadsPerDataDir,
+      flushCheckMs = opts.kafkaConfig.logFlushSchedulerIntervalMs,
+      flushRecoveryOffsetCheckpointMs = opts.kafkaConfig.logFlushOffsetCheckpointIntervalMs,
+      flushStartOffsetCheckpointMs = opts.kafkaConfig.logFlushStartOffsetCheckpointIntervalMs,
+      retentionCheckMs = opts.kafkaConfig.logCleanupIntervalMs,
+      maxPidExpirationMs = opts.kafkaConfig.transactionalIdExpirationMs,
       scheduler,
       brokerState = BrokerState(),
       brokerTopicStats = new BrokerTopicStats(),
@@ -81,14 +86,11 @@ object StressLog extends Logging {
     )
 
     println("starting up")
-    println("log config:")
-
-    println(opts.logConfig.values())
 
     logManager.startup()
 
     val logWriters = (0 until opts.numWriters).map(i =>
-      (i, new LogWriter(logManager.getOrCreateLog(new TopicPartition("stress", i), opts.logConfig))))
+      (i, new LogWriter(logManager.getOrCreateLog(new TopicPartition("stress", i), defaultLogConfig))))
 
     val threads = logWriters.map {
       case (id, writer) =>
@@ -138,7 +140,7 @@ object StressLog extends Logging {
       .withOptionalArg()
       .ofType(classOf[java.lang.Long])
       .defaultsTo(Duration.ofSeconds(10).getSeconds)
-    private val logConfigOpt = parser.accepts("log-config", "configuration for the log manager")
+    private val kafkaConfigOpt = parser.accepts("kafka-config", "configuration for the log manager (should use Kafka config properties, not log config)")
       .withOptionalArg()
       .ofType(classOf[java.lang.String])
     private val logDirOpt = parser.accepts("log-dir", "directory where log files will be written")
@@ -152,10 +154,10 @@ object StressLog extends Logging {
     val numWriters: Integer = options.valueOf(numWritersOpt).intValue()
     val duration: Duration = Duration.ofSeconds(options.valueOf(durationSecsOpt).longValue())
     val logDir: String = options.valueOf(logDirOpt)
-    val logConfig: LogConfig = if (options.hasArgument(logConfigOpt)) {
-      new LogConfig(Utils.loadProps(options.valueOf(logConfigOpt)))
+    val kafkaConfig: KafkaConfig = if (options.hasArgument(kafkaConfigOpt)) {
+      new KafkaConfig(Utils.loadProps(options.valueOf(kafkaConfigOpt)))
     } else {
-      LogConfig()
+      new KafkaConfig(new Properties())
     }
   }
 
