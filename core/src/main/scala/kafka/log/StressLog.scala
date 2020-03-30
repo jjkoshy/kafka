@@ -57,7 +57,7 @@ object StressLog extends Logging {
     override def run(): Unit = {
       println("starting reader " + log.name)
       while (!StressLog.shuttingDown.get()) {
-        val offset = log.logEndOffset - 1
+        val offset = log.logEndOffset - 100
         if (offset >= 0) {
           val result = log.read(
             offset,
@@ -66,7 +66,14 @@ object StressLog extends Logging {
             minOneMessage = true,
             includeAbortedTxns = true
           )
-          bytesRead.getAndAdd(result.records.sizeInBytes())
+          if (!result.firstEntryIncomplete) {
+            val batchIt = result.records.batchIterator()
+            while (batchIt.hasNext) {
+              val next = batchIt.next()
+              if (next.isValid)
+                bytesRead.addAndGet(next.sizeInBytes())
+            }
+          }
         }
       }
     }
@@ -204,10 +211,13 @@ object StressLog extends Logging {
     val duration: Duration = Duration.ofSeconds(options.valueOf(durationSecsOpt).longValue())
     val logDir: String = options.valueOf(logDirOpt)
     val kafkaConfig: KafkaConfig = if (options.hasArgument(kafkaConfigOpt)) {
-      new KafkaConfig(Utils.loadProps(options.valueOf(kafkaConfigOpt)))
+      val props = Utils.loadProps(options.valueOf(kafkaConfigOpt))
+      props.put("log.message.format.version", "0.10.0") // force message format 0.10.0
+      new KafkaConfig(props)
     } else {
       val props = new Properties()
       props.put("zookeeper.connect", "localhost:0")
+      props.put("log.message.format.version", "0.10.0") // force message format 0.10.0
       new KafkaConfig(props)
     }
   }
