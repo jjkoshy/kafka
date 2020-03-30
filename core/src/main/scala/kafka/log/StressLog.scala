@@ -51,6 +51,27 @@ object StressLog extends Logging {
     }
   }
 
+  private class LogReader(log: Log) extends Runnable with Logging {
+    val bytesRead = new AtomicLong(0)
+
+    override def run(): Unit = {
+      println("starting reader " + log.name)
+      while (!StressLog.shuttingDown.get()) {
+        val offset = log.logEndOffset - 1
+        if (offset >= 0) {
+          val result = log.read(
+            offset,
+            maxLength = 1048576,
+            maxOffset = None,
+            minOneMessage = true,
+            includeAbortedTxns = true
+          )
+          bytesRead.getAndAdd(result.records.sizeInBytes())
+        }
+      }
+    }
+  }
+
   val shuttingDown = new AtomicBoolean(false)
 
   def main(args: Array[String]): Unit = {
@@ -92,20 +113,42 @@ object StressLog extends Logging {
     val logWriters = (0 until opts.numWriters).map(i =>
       (i, new LogWriter(logManager.getOrCreateLog(new TopicPartition("stress", i), defaultLogConfig))))
 
-    val threads = logWriters.map {
+    val logReaders = (0 until opts.numWriters).flatMap(i => {
+      (0 until opts.readFanout).map { subid =>
+        (i + "-" + subid, new LogReader(logManager.getOrCreateLog(new TopicPartition("stress", i), defaultLogConfig)))
+      }
+    })
+
+    val writerThreads = logWriters.map {
       case (id, writer) =>
         KafkaThread.nonDaemon("writer-" + id, writer)
     }
 
-    threads.foreach(t => {
+    val readerThreads = logReaders.map {
+      case (id, reader) =>
+        KafkaThread.nonDaemon("reader-" + id, reader)
+    }
+
+    writerThreads.foreach(t => {
+      // not setting uncaught exception handler
+      t.start()
+    })
+
+    readerThreads.foreach(t => {
       // not setting uncaught exception handler
       t.start()
     })
 
     scheduler.schedule("progress",
-      () => logWriters.foreach {
-        case (id, writer) =>
-          println("writer " + id + " - wrote " + writer.bytesWritten.getAndSet(0L) + " bytes ; " + writer.totalBytesWritten.get() + " bytes total")
+      () => {
+        logWriters.foreach {
+          case (id, writer) =>
+            println("writer " + id + " - wrote " + writer.bytesWritten.getAndSet(0L) + " bytes ; " + writer.totalBytesWritten.get() + " bytes total")
+        }
+        logReaders.foreach {
+          case (id, reader) =>
+            println("reader " + id + " - read " + reader.bytesRead.getAndSet(0L) + " bytes")
+        }
       },
       delay = 5000L,
       period = 5000L,
@@ -113,7 +156,8 @@ object StressLog extends Logging {
 
     def cleanShutdown(): Unit = {
       println("shutting down")
-      threads.foreach(_.join())
+      writerThreads.foreach(_.join())
+      readerThreads.foreach(_.join())
       CoreUtils.swallow(scheduler.shutdown(), this)
       CoreUtils.swallow(logManager.shutdown(), this)
     }
@@ -136,6 +180,10 @@ object StressLog extends Logging {
       .withOptionalArg()
       .ofType(classOf[java.lang.Integer])
       .defaultsTo(1)
+    private val readFanoutOpt = parser.accepts("read-fanout", "read fanout - instantiate this many readers")
+      .withOptionalArg()
+      .ofType(classOf[java.lang.Integer])
+      .defaultsTo(0)
     private val durationSecsOpt = parser.accepts("duration-secs", "duration of the stress test in seconds (if uninterrupted by user)")
       .withOptionalArg()
       .ofType(classOf[java.lang.Long])
@@ -152,13 +200,15 @@ object StressLog extends Logging {
     CommandLineUtils.checkRequiredArgs(parser, options, logDirOpt)
 
     val numWriters: Integer = options.valueOf(numWritersOpt).intValue()
+    val readFanout: Integer = options.valueOf(readFanoutOpt).intValue()
     val duration: Duration = Duration.ofSeconds(options.valueOf(durationSecsOpt).longValue())
     val logDir: String = options.valueOf(logDirOpt)
     val kafkaConfig: KafkaConfig = if (options.hasArgument(kafkaConfigOpt)) {
       new KafkaConfig(Utils.loadProps(options.valueOf(kafkaConfigOpt)))
     } else {
-      new KafkaConfig(new Properties())
+      val props = new Properties()
+      props.put("zookeeper.connect", "localhost:0")
+      new KafkaConfig(props)
     }
   }
-
 }
